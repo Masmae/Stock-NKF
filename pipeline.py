@@ -25,20 +25,21 @@ from sklearn.decomposition import PCA
 # 0. Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-CSV_PATH       = "stock.csv"   # change to your path
-WINDOW         = 20            # shorter window → more training samples
+CSV_PATH       = "stock.csv"   # stock data path
+COMM_PATH      = "comm.csv"    # commodity data path
+WINDOW         = 30            # longer window captures momentum/earnings cycles
 HORIZON        = 5             # steps ahead to forecast
 TRAIN_RATIO    = 0.7
 VAL_RATIO      = 0.15          # remaining 0.15 → test
-BATCH_SIZE     = 32
-N_EPOCHS       = 50            # early stopping will kick in before this
-LR             = 3e-4          # slower start reduces early overfitting
-STATE_DIM      = 2             # level + trend per stock
-FLOW_LAYERS    = 2             # fewer flow layers → less capacity
-HIDDEN         = 32            # smaller coupling nets + LSTM
-LSTM_LAYERS    = 1             # single LSTM layer
-N_SAMPLES      = 200           # Monte Carlo forecast samples
-PCA_COMPONENTS = 20            # reduce covariates via PCA
+BATCH_SIZE     = 100
+N_EPOCHS       = 100            # early stopping will kick in before this
+LR             = 1e-3          # slower start reduces early overfitting
+STATE_DIM      = 3             # level + trend + volatility state
+FLOW_LAYERS    = 1             # fewer flow layers → less capacity
+HIDDEN         = 8             # smaller coupling nets + LSTM
+LSTM_LAYERS    = 2             # single LSTM layer
+N_SAMPLES      = 1000           # Monte Carlo forecast samples
+PCA_COMPONENTS = 50            # increased to capture ~90% variance
 EARLY_STOP_PATIENCE = 7        # stop if val NLL doesn't improve
 DEVICE         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -47,63 +48,127 @@ DEVICE         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # 1. Data Loading & Feature Engineering
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_data(path: str):
+def _parse_ohlcv(df):
     """
-    Parse yfinance multi-level CSV.
-    Returns
-    -------
-    close  : pd.DataFrame  (T, 20)   — stock close prices
-    covars : pd.DataFrame  (T, k)    — High/Low/Open/Vol per stock + calendar
-    dates  : pd.DatetimeIndex
+    Parse a yfinance multi-level CSV (already loaded as DataFrame with MultiIndex columns).
+    Returns dict of {price_type: DataFrame(T, n_tickers)}.
     """
-    df = pd.read_csv(path, header=[0, 1], index_col=0, skiprows=[2])
-    df.index = pd.to_datetime(df.index)
-    df.index.name = "Date"
-    df = df.sort_index()
+    return {
+        pt: df[pt].astype(float)
+        for pt in ["Close", "High", "Low", "Open", "Volume"]
+        if pt in df.columns.get_level_values(0)
+    }
 
-    tickers = df["Close"].columns.tolist()
-    N = len(tickers)   # 20
 
-    close  = df["Close"].astype(float)
-    high   = df["High"].astype(float)
-    low    = df["Low"].astype(float)
-    open_  = df["Open"].astype(float)
-    volume = df["Volume"].astype(float)
+def _make_features(ohlcv: dict, label: str):
+    """
+    Build log-return features from an OHLCV dict.
+    Returns a DataFrame of covariates aligned to the close_ret index.
 
-    # ── Calendar features (same for all stocks, added once) ───────────────
-    cal = pd.DataFrame(index=df.index)
-    cal["day_of_week"]     = df.index.dayofweek / 4.0        # 0-1
-    cal["month"]           = (df.index.month - 1) / 11.0     # 0-1
-    cal["is_quarter_end"]  = df.index.is_quarter_end.astype(float)
+    Lookahead note
+    ──────────────
+    x[t] contains same-day OHLCV (open/high/low of day t alongside close of day t).
+    This is standard daily-bar practice — open/high/low are known before market close.
+    Rolling features at t use days t-k..t, which is causal given we observe y[t].
+    Prediction target is always y[e] where e > window end — strictly future.
+    """
+    close  = ohlcv["Close"]
+    high   = ohlcv["High"]
+    low    = ohlcv["Low"]
+    open_  = ohlcv["Open"]
+    volume = ohlcv["Volume"]
+    tickers = close.columns.tolist()
 
-    # ── Derived per-stock features ────────────────────────────────────────
-    # Range = (High - Low) / Close  — normalised intra-day range
-    intra_range = ((high - low) / close.replace(0, np.nan)).fillna(0)
-    intra_range.columns = [f"range_{t}" for t in tickers]
+    # ── Log returns ───────────────────────────────────────────────
+    close_ret = np.log(close / close.shift(1)).iloc[1:]
+    high_ret  = np.log(high  / high.shift(1) ).iloc[1:]
+    low_ret   = np.log(low   / low.shift(1)  ).iloc[1:]
+    open_ret  = np.log(open_ / open_.shift(1)).iloc[1:]
 
-    # Log volume (more Gaussian, avoids scale issues)
-    log_vol = np.log1p(volume)
-    log_vol.columns = [f"logvol_{t}" for t in tickers]
+    high_ret.columns  = [f"{label}_high_{t}"  for t in tickers]
+    low_ret.columns   = [f"{label}_low_{t}"   for t in tickers]
+    open_ret.columns  = [f"{label}_open_{t}"  for t in tickers]
 
-    # Stack all covariates  (T, k)
-    covars = pd.concat([high, low, open_, intra_range, log_vol, cal], axis=1)
-    covars.columns = (
-        [f"high_{t}"  for t in tickers] +
-        [f"low_{t}"   for t in tickers] +
-        [f"open_{t}"  for t in tickers] +
-        [f"range_{t}" for t in tickers] +
-        [f"logvol_{t}" for t in tickers] +
-        list(cal.columns)
+    # ── Intra-day range ───────────────────────────────────────────
+    intra = ((high - low) / close.replace(0, np.nan)).iloc[1:].fillna(0)
+    intra.columns = [f"{label}_range_{t}" for t in tickers]
+
+    # ── Log volume ────────────────────────────────────────────────
+    log_vol = np.log1p(volume.iloc[1:])
+    log_vol.columns = [f"{label}_logvol_{t}" for t in tickers]
+
+    # ── Volatility clustering (rolling std of returns) ────────────
+    # Gives LSTM a direct signal to set Gamma_t on high-vol days
+    vol10 = close_ret.rolling(10).std().fillna(0)
+    vol20 = close_ret.rolling(20).std().fillna(0)
+    vol10.columns = [f"{label}_vol10_{t}" for t in tickers]
+    vol20.columns = [f"{label}_vol20_{t}" for t in tickers]
+
+    # ── Momentum (cumulative returns) ─────────────────────────────
+    mom5  = close_ret.rolling(5).sum().fillna(0)
+    mom20 = close_ret.rolling(20).sum().fillna(0)
+    mom5.columns  = [f"{label}_mom5_{t}"  for t in tickers]
+    mom20.columns = [f"{label}_mom20_{t}" for t in tickers]
+
+    return close_ret, pd.concat(
+        [high_ret, low_ret, open_ret, intra, log_vol, vol10, vol20, mom5, mom20],
+        axis=1
     )
 
-    # Drop any rows where close has NaN (missing trading days already dropped)
-    mask = close.notna().all(axis=1) & covars.notna().all(axis=1)
-    close  = close[mask]
-    covars = covars[mask]
 
-    print(f"Loaded  {len(close)} trading days  |  {N} stocks  |  {covars.shape[1]} covariates")
-    print(f"Date range: {close.index[0].date()} → {close.index[-1].date()}")
-    return close, covars, close.index
+def load_data(stock_path: str, comm_path: str):
+    """
+    Parse stock + commodity CSVs (yfinance multi-level format).
+
+    Returns
+    -------
+    close_ret : pd.DataFrame  (T, 20)   log returns of stock closes  → y (observations)
+    close_raw : pd.DataFrame  (T, 20)   raw stock close prices       → kept for reference
+    covars    : pd.DataFrame  (T, k)    all features                 → x (covariates)
+    dates     : pd.DatetimeIndex
+    """
+    def read_csv(path):
+        df = pd.read_csv(path, header=[0, 1], index_col=0, skiprows=[2])
+        df.index = pd.to_datetime(df.index)
+        df.index.name = "Date"
+        return df.sort_index()
+
+    stock_df = read_csv(stock_path)
+    comm_df  = read_csv(comm_path)
+
+    stock_ohlcv = _parse_ohlcv(stock_df)
+    comm_ohlcv  = _parse_ohlcv(comm_df)
+
+    # ── Observations: stock close log returns ─────────────────────
+    close_raw                  = stock_ohlcv["Close"].copy()
+    stock_close_ret, stock_cov = _make_features(stock_ohlcv, label="stk")
+    _,               comm_cov  = _make_features(comm_ohlcv,  label="com")
+
+    # ── Calendar features (shared, added once) ────────────────────
+    cal = pd.DataFrame(index=stock_close_ret.index)
+    cal["dow"]           = stock_close_ret.index.dayofweek / 4.0
+    cal["month"]         = (stock_close_ret.index.month - 1) / 11.0
+    cal["qtr_end"]       = stock_close_ret.index.is_quarter_end.astype(float)
+
+    # ── Align all frames on common dates (inner join) ─────────────
+    covars = pd.concat([stock_cov, comm_cov, cal], axis=1)
+    common_idx = stock_close_ret.index.intersection(covars.index)
+    close_ret  = stock_close_ret.loc[common_idx]
+    covars     = covars.loc[common_idx]
+    close_raw  = close_raw.loc[close_raw.index.isin(common_idx)]
+
+    # ── Drop any remaining NaNs ───────────────────────────────────
+    mask      = close_ret.notna().all(axis=1) & covars.notna().all(axis=1)
+    close_ret = close_ret[mask]
+    covars    = covars[mask]
+    close_raw = close_raw.loc[close_raw.index.isin(close_ret.index)]
+
+    N_stocks = len(stock_ohlcv["Close"].columns)
+    print(f"Loaded  {len(close_ret)} trading days  |  "
+          f"{N_stocks} stocks + {len(comm_ohlcv['Close'].columns)} commodities  |  "
+          f"{covars.shape[1]} raw covariates")
+    print(f"Date range: {close_ret.index[0].date()} → {close_ret.index[-1].date()}")
+    return close_ret, close_raw, covars, close_ret.index
 
 
 def split_and_scale(close, covars, train_r=0.7, val_r=0.15, pca_components=20):
@@ -127,11 +192,19 @@ def split_and_scale(close, covars, train_r=0.7, val_r=0.15, pca_components=20):
     x_scaled = x_scaler.transform(x_raw)
 
     # ── PCA on covariates (fit on train only) ─────────────────────
-    pca    = PCA(n_components=pca_components, random_state=42).fit(x_scaled[:t1])
+    # First fit with max components to find how many reach the threshold
+    pca_full  = PCA(random_state=42).fit(x_scaled[:t1])
+    cum_var   = np.cumsum(pca_full.explained_variance_ratio_)
+    n_needed  = int(np.searchsorted(cum_var, 0.90)) + 1
+    n_components = max(pca_components, n_needed)
+    print(f"PCA: {x_raw.shape[1]} raw features  |  "
+          f"{n_needed} components for 95% variance  |  "
+          f"using {n_components}")
+
+    pca    = PCA(n_components=n_components, random_state=42).fit(x_scaled[:t1])
     x      = pca.transform(x_scaled).astype(np.float32)
     var_ex = pca.explained_variance_ratio_.sum()
-    print(f"PCA: {x_raw.shape[1]} → {pca_components} components  "
-          f"({var_ex:.1%} variance explained)")
+    print(f"     Variance explained: {var_ex:.1%}")
 
     # ── Scale close prices ────────────────────────────────────────
     y_scaler = StandardScaler().fit(y_raw[:t1])
@@ -506,7 +579,7 @@ def crps_sum(samples: np.ndarray, targets: np.ndarray) -> float:
 
 
 @torch.no_grad()
-def evaluate(model, loader, n_samples, horizon, device):
+def evaluate(model, loader, n_samples, horizon, device, y_scaler, tickers):
     model.eval()
     all_samples = []
     all_targets = []
@@ -514,139 +587,271 @@ def evaluate(model, loader, n_samples, horizon, device):
     for x_win, y_win, y_tgt in loader:
         x_win = x_win.to(device)
         y_win = y_win.to(device)
-
-        # We forecast HORIZON steps using the last WINDOW as history.
-        # For simplicity we re-use x_win as x_future (real setup: pass future covariates).
-        x_fut = x_win[:, -horizon:, :]   # (B, H, k)  — last H covariate steps
-
+        x_fut = x_win[:, -1:, :].expand(-1, horizon, -1).clone()
         samps = model.forecast(y_win, x_win, x_fut, n_samples=n_samples)
-        # samps: (B, S, T_fut, N)
         all_samples.append(samps.cpu().numpy())
         all_targets.append(y_tgt.numpy())
 
     samples = np.concatenate(all_samples, axis=0)   # (W, S, H, N)
     targets = np.concatenate(all_targets, axis=0)   # (W, H, N)
 
-    # Rearrange to (W, S, H, N) → already in that shape
-    crps = crps_sum(samples.transpose(0,1,2,3), targets)
-    mae  = np.abs(samples.mean(1) - targets).mean()
-    print(f"  CRPS-Sum-N : {crps:.6f}")
-    print(f"  MAE        : {mae:.6f}")
-    return crps, mae
+    # Inverse-transform to raw log returns for interpretable metrics
+    W, S, H, N = samples.shape
+    samp_ret = y_scaler.inverse_transform(
+        samples.reshape(-1, N)).reshape(W, S, H, N)
+    tgt_ret  = y_scaler.inverse_transform(
+        targets.reshape(-1, N)).reshape(W, H, N)
+
+    pred_mean = samp_ret.mean(axis=1)   # (W, H, N)
+    pred_std  = samp_ret.std(axis=1)    # (W, H, N)
+
+    # ── CRPS-Sum (paper metric) ───────────────────────────────────
+    crps = crps_sum(samp_ret, tgt_ret)
+
+    # ── MAE on log returns ────────────────────────────────────────
+    mae = np.abs(pred_mean - tgt_ret).mean()
+
+    # ── Directional accuracy (1-step ahead) ───────────────────────
+    # % of days where predicted and real return have same sign
+    dir_acc = (np.sign(pred_mean[:, 0, :]) == np.sign(tgt_ret[:, 0, :])).mean()
+
+    # ── Calibration (1-step ahead) ────────────────────────────────
+    # Fraction of real returns within predicted mean ± 1 std
+    # Well-calibrated model → ~68%
+    within_1std = (np.abs(tgt_ret[:, 0, :] - pred_mean[:, 0, :]) < pred_std[:, 0, :]).mean()
+
+    print(f"  CRPS-Sum-N         : {crps:.6f}")
+    print(f"  MAE (log return)   : {mae:.6f}")
+    print(f"  Directional Acc    : {dir_acc:.2%}  (random baseline = 50%)")
+    print(f"  Calibration ±1std  : {within_1std:.2%}  (ideal = 68%)")
+
+    # ── Per-stock CRPS (1-step ahead) ─────────────────────────────
+    print("\n  Per-stock CRPS (1-step):")
+    per_stock_crps = []
+    for s in range(N):
+        s_samp = samp_ret[:, :, 0, s]   # (W, S)
+        s_tgt  = tgt_ret[:,  0,    s]   # (W,)
+        e1 = np.abs(s_samp - s_tgt[:, None]).mean()
+        e2 = 0.5 * np.abs(s_samp[:, :, None] - s_samp[:, None, :]).mean()
+        per_stock_crps.append(e1 - e2)
+        print(f"    {tickers[s]:6s}: {per_stock_crps[-1]:.6f}")
+
+    return crps, mae, dir_acc, within_1std, per_stock_crps
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. Plotting
-# ─────────────────────────────────────────────────────────────────────────────
+def evaluate_random_walk(loader, y_scaler, tickers, horizon):
+    """
+    Random Walk baseline: predict 0 return for all stocks at all horizons.
+    This is the hardest baseline to beat in financial return forecasting.
+
+    For CRPS we model the RW as a Gaussian with mean=0 and std estimated
+    from the training window's empirical return std — this gives it a fair
+    probabilistic score rather than penalising it for having no uncertainty.
+    """
+    all_targets  = []
+    all_win_stds = []   # empirical std from each input window
+
+    for _, y_win, y_tgt in loader:
+        all_targets.append(y_tgt.numpy())               # (B, H, N)
+        # std over the input window — used as the RW's predictive std
+        all_win_stds.append(y_win.numpy().std(axis=1))  # (B, N)
+
+    targets   = np.concatenate(all_targets,  axis=0)   # (W, H, N)
+    win_stds  = np.concatenate(all_win_stds, axis=0)   # (W, N)
+
+    # Inverse-transform to raw log returns
+    W, H, N = targets.shape
+    tgt_ret  = y_scaler.inverse_transform(
+        targets.reshape(-1, N)).reshape(W, H, N)
+    win_stds = win_stds * y_scaler.scale_               # scale std only
+
+    # ── RW prediction: mean=0, std=empirical window std ──────────
+    rw_mean = np.zeros_like(tgt_ret)                    # (W, H, N)
+    # Broadcast win_stds across horizon steps
+    rw_std  = win_stds[:, np.newaxis, :].repeat(H, axis=1)  # (W, H, N)
+
+    # ── Build Gaussian samples for CRPS ──────────────────────────
+    rng      = np.random.default_rng(42)
+    S        = 500   # samples for CRPS estimation
+    rw_samps = rw_mean[:, np.newaxis, :, :] + \
+               rw_std[:, np.newaxis, :, :]  * \
+               rng.standard_normal((W, S, H, N))       # (W, S, H, N)
+
+    # ── Metrics ───────────────────────────────────────────────────
+    crps     = crps_sum(rw_samps, tgt_ret)
+    mae      = np.abs(rw_mean - tgt_ret).mean()
+    dir_acc  = 0.50   # by definition — always predicts 0
+
+    # Calibration: fraction of real returns within ±1 RW std
+    within_1std = (np.abs(tgt_ret[:, 0, :]) < rw_std[:, 0, :]).mean()
+
+    print(f"  CRPS-Sum-N         : {crps:.6f}")
+    print(f"  MAE (log return)   : {mae:.6f}")
+    print(f"  Directional Acc    : {dir_acc:.2%}  (random by definition)")
+    print(f"  Calibration ±1std  : {within_1std:.2%}  (ideal = 68%)")
+
+    # ── Per-stock CRPS ────────────────────────────────────────────
+    print("\n  Per-stock CRPS (1-step):")
+    per_stock_crps = []
+    for s in range(N):
+        s_samp = rw_samps[:, :, 0, s]
+        s_tgt  = tgt_ret[:,  0,    s]
+        e1 = np.abs(s_samp - s_tgt[:, None]).mean()
+        e2 = 0.5 * np.abs(s_samp[:, :, None] - s_samp[:, None, :]).mean()
+        per_stock_crps.append(e1 - e2)
+        print(f"    {tickers[s]:6s}: {per_stock_crps[-1]:.6f}")
+
+    return crps, mae, dir_acc, within_1std, per_stock_crps
 
 import matplotlib.pyplot as plt
 
 @torch.no_grad()
 def plot_predictions(model, loader, y_scaler, tickers, n_samples,
-                     horizon, device, n_stocks=4, n_windows=3):
+                     horizon, device, n_stocks=4):
     """
-    Plot predicted mean +/- std vs real close prices for a few stocks and windows.
-    Prices are inverse-transformed back to original USD scale.
+    Plot predicted vs real log returns over the full test set.
+    One subplot per stock. X-axis = test window index, Y-axis = log return.
+    Takes only the 1-step-ahead forecast from each window.
     """
     model.eval()
 
-    x_win, y_win, y_tgt = next(iter(loader))
-    x_win = x_win.to(device)
-    y_win = y_win.to(device)
-    x_fut = x_win[:, -horizon:, :]
+    all_pred_mean = []
+    all_pred_std  = []
+    all_real      = []
 
-    samps = model.forecast(y_win, x_win, x_fut, n_samples=n_samples)
-    # samps: (B, S, T_fut, N)
+    for x_win, y_win, y_tgt in loader:
+        x_win = x_win.to(device)
+        y_win = y_win.to(device)
+        x_fut = x_win[:, -1:, :].expand(-1, horizon, -1).clone()
 
-    B, S, H, N = samps.shape
-    samps_np = samps.cpu().numpy()
-    y_tgt_np = y_tgt.numpy()
-    y_win_np = y_win.cpu().numpy()
+        samps = model.forecast(y_win, x_win, x_fut, n_samples=n_samples)
+        B, S, H, N = samps.shape
 
-    # Inverse-transform back to original USD prices
-    samps_orig = y_scaler.inverse_transform(
-        samps_np.reshape(-1, N)).reshape(B, S, H, N)
-    y_tgt_orig = y_scaler.inverse_transform(
-        y_tgt_np.reshape(-1, N)).reshape(B, H, N)
-    y_win_orig = y_scaler.inverse_transform(
-        y_win_np.reshape(-1, N)).reshape(B, -1, N)
+        pred_t1 = samps[:, :, 0, :]                          # (B, S, N)
+        all_pred_mean.append(pred_t1.mean(1).cpu().numpy())  # (B, N)
+        all_pred_std.append( pred_t1.std(1).cpu().numpy())   # (B, N)
+        all_real.append(y_tgt[:, 0, :].numpy())              # (B, N)
 
-    W = y_win_orig.shape[1]
-    x_hist = np.arange(W)
-    x_fore = np.arange(W - 1, W + H)
+    pred_ret_mean = np.concatenate(all_pred_mean, axis=0)    # (W, N) — scaled returns
+    pred_ret_std  = np.concatenate(all_pred_std,  axis=0)    # (W, N)
+    real_ret      = np.concatenate(all_real,      axis=0)    # (W, N) — scaled returns
+
+    # ── Inverse-transform: scaled returns → raw log returns ──────
+    pred_ret_mean = y_scaler.inverse_transform(pred_ret_mean)
+    real_ret      = y_scaler.inverse_transform(real_ret)
+    pred_ret_std  = pred_ret_std * y_scaler.scale_
+
+    W  = real_ret.shape[0]
+    xs = np.arange(W)
 
     stock_idx = np.linspace(0, N - 1, n_stocks, dtype=int)
-    n_windows  = min(n_windows, B)
 
-    fig, axes = plt.subplots(n_windows, n_stocks,
-                             figsize=(5 * n_stocks, 3 * n_windows),
+    fig, axes = plt.subplots(n_stocks, 1,
+                             figsize=(14, 3.5 * n_stocks),
                              squeeze=False)
-    fig.suptitle("NKF: Predicted vs Real Close Prices (USD)", fontsize=14, y=1.01)
+    fig.suptitle("NKF: Predicted vs Real — Full Test Set (1-step ahead, Log Return)",
+                 fontsize=13, y=1.01)
 
-    for row, w in enumerate(range(n_windows)):
-        for col, s in enumerate(stock_idx):
-            ax = axes[row][col]
+    for row, s in enumerate(stock_idx):
+        ax = axes[row][0]
+        ax.plot(xs, real_ret[:, s],      color="steelblue", lw=1.0, label="Real return")
+        ax.plot(xs, pred_ret_mean[:, s], color="tomato",    lw=1.0,
+                linestyle="--", label="Pred mean")
+        ax.fill_between(xs,
+                        pred_ret_mean[:, s] - pred_ret_std[:, s],
+                        pred_ret_mean[:, s] + pred_ret_std[:, s],
+                        color="tomato", alpha=0.2, label="+/-1 std")
+        ax.axhline(0, color="gray", lw=0.8, linestyle=":")
+        ax.set_title(tickers[s], fontsize=11)
+        ax.set_ylabel("Log return")
+        ax.legend(fontsize=8, loc="upper left")
+        ax.grid(True, alpha=0.3)
 
-            hist   = y_win_orig[w, :, s]
-            real   = y_tgt_orig[w, :, s]
-            pred_m = samps_orig[w, :, :, s].mean(0)
-            pred_s = samps_orig[w, :, :, s].std(0)
-
-            ax.plot(x_hist, hist, color="steelblue", lw=1.2, label="History")
-
-            # Bridge last history point to first forecast point
-            ax.plot([W - 1, W], [hist[-1], real[0]],   color="green",  lw=1.2)
-            ax.plot([W - 1, W], [hist[-1], pred_m[0]], color="tomato", lw=1.2)
-
-            ax.plot(x_fore[1:], real,   color="green",  lw=1.5, label="Real")
-            ax.plot(x_fore[1:], pred_m, color="tomato", lw=1.5,
-                    linestyle="--", label="Pred mean")
-            ax.fill_between(x_fore[1:],
-                            pred_m - pred_s,
-                            pred_m + pred_s,
-                            color="tomato", alpha=0.2, label="+/-1 std")
-
-            ax.axvline(W - 1, color="gray", linestyle=":", lw=1)
-            ax.set_title(f"{tickers[s]}  (window {w})", fontsize=10)
-            ax.set_xlabel("Trading days")
-            if col == 0:
-                ax.set_ylabel("Price (USD)")
-            if row == 0 and col == 0:
-                ax.legend(fontsize=8)
-
+    axes[-1][0].set_xlabel("Test window index")
+    import os, datetime
+    os.makedirs("figs", exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_path = f"figs/nkf_test_predictions_{timestamp}.png"
     plt.tight_layout()
-    plt.savefig("nkf_predictions.png", dpi=150, bbox_inches="tight")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
-    print("Saved -> nkf_predictions.png")
+    print(f"Saved -> {save_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Main
+# 7. Handle registry
 # ─────────────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+import argparse, os, datetime
+
+_HANDLES = {}
+
+def handle(name: str):
+    """
+    Decorator that registers a function as a runnable handle.
+    Usage:  python pipeline.py --run nkf
+            python pipeline.py --run rw
+            python pipeline.py --run all
+    """
+    def decorator(fn):
+        _HANDLES[name] = fn
+        return fn
+    return decorator
+
+
+def _load_shared():
+    """
+    Load and preprocess data shared by all handles.
+    Returns loaders, tickers, y_scaler, pca.
+    """
     print("=" * 60)
     print("Normalizing Kalman Filter — Stock Forecasting Pipeline")
     print("=" * 60)
 
-    # ── Load & process ──────────────────────────────────────────
-    close, covars, dates = load_data(CSV_PATH)
+    close, close_raw, covars, dates = load_data(CSV_PATH, COMM_PATH)
 
     print(f"\nBefore drop_nulls: {close.shape}")
-    mask = close.notna().all(axis=1) & covars.notna().all(axis=1)
-    close  = close[mask]
-    covars = covars[mask]
+    mask      = close.notna().all(axis=1) & covars.notna().all(axis=1)
+    close     = close[mask].sort_index()
+    close_raw = close_raw.loc[close_raw.index.isin(close.index)].sort_index()
+    covars    = covars[mask].sort_index()
     print(f"After  drop_nulls: {close.shape}")
 
     splits, y_scaler, x_scaler, pca = split_and_scale(
         close, covars, TRAIN_RATIO, VAL_RATIO, PCA_COMPONENTS
     )
-
     loaders = make_loaders(splits, WINDOW, HORIZON, BATCH_SIZE)
-
     tickers = close.columns.tolist()
-    N = close.shape[1]
-    k = PCA_COMPONENTS
+    return loaders, tickers, y_scaler, pca
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+@handle("rw")
+def run_random_walk():
+    """
+    Evaluate Random Walk baseline on the test set.
+    Run with:  python pipeline.py --run rw
+    """
+    loaders, tickers, y_scaler, _ = _load_shared()
+
+    print("\n── Random Walk Baseline (test set) ───────────────────────")
+    results = evaluate_random_walk(loaders["test"], y_scaler, tickers, HORIZON)
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+@handle("nkf")
+def run_nkf():
+    """
+    Train and evaluate the full NKF model.
+    Run with:  python pipeline.py --run nkf
+    """
+    loaders, tickers, y_scaler, pca = _load_shared()
+
+    N = len(tickers)
+    k = pca.n_components_
 
     # ── Build model ─────────────────────────────────────────────
     model = NKF(
@@ -660,8 +865,7 @@ if __name__ == "__main__":
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel on {DEVICE}  |  {n_params:,} trainable parameters")
-    print(f"  N (stocks)   = {N}")
-    print(f"  k (covars)   = {k}")
+    print(f"  N (stocks)   = {N}  |  k (covars) = {k}")
     print(f"  Window/Horiz = {WINDOW}/{HORIZON}")
 
     # ── Train ────────────────────────────────────────────────────
@@ -670,27 +874,99 @@ if __name__ == "__main__":
 
     # ── Evaluate ─────────────────────────────────────────────────
     print("\n── Validation set ────────────────────────────────────────")
-    evaluate(model, loaders["val"], N_SAMPLES, HORIZON, DEVICE)
+    evaluate(model, loaders["val"], N_SAMPLES, HORIZON, DEVICE, y_scaler, tickers)
 
     print("\n── Test set ──────────────────────────────────────────────")
-    evaluate(model, loaders["test"], N_SAMPLES, HORIZON, DEVICE)
+    results = evaluate(
+        model, loaders["test"], N_SAMPLES, HORIZON, DEVICE, y_scaler, tickers
+    )
 
     # ── Plot ─────────────────────────────────────────────────────
     print("\n── Forecast Plots ────────────────────────────────────────")
     plot_predictions(model, loaders["test"], y_scaler, tickers,
                      n_samples=N_SAMPLES, horizon=HORIZON, device=DEVICE,
-                     n_stocks=4, n_windows=3)
+                     n_stocks=4)
 
-    # ── Save ─────────────────────────────────────────────────────
+    # ── Save weights ─────────────────────────────────────────────
     torch.save(model.state_dict(), "nkf_weights.pt")
-    print("\nWeights saved to nkf_weights.pt")
+    print("\nWeights saved → nkf_weights.pt")
 
-    # ─────────────────────────────────────────────────────────────
-    # NOTE: To add commodities / news, concatenate them to covars
-    # before calling split_and_scale, e.g.:
-    #
-    #   comm_df  = pd.read_csv("commodities.csv", index_col=0, parse_dates=True)
-    #   news_df  = pd.read_csv("news_sentiment.csv", index_col=0, parse_dates=True)
-    #   covars   = pd.concat([covars, comm_df, news_df], axis=1).dropna()
-    #   close    = close.loc[covars.index]
-    # ─────────────────────────────────────────────────────────────
+    return results, model
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+@handle("all")
+def run_all():
+    """
+    Run NKF + Random Walk and print a side-by-side comparison table.
+    Run with:  python pipeline.py --run all
+    """
+    loaders, tickers, y_scaler, pca = _load_shared()
+
+    N = len(tickers)
+    k = pca.n_components_
+
+    # ── Random Walk ──────────────────────────────────────────────
+    print("\n── Random Walk Baseline (test set) ───────────────────────")
+    rw_results = evaluate_random_walk(loaders["test"], y_scaler, tickers, HORIZON)
+
+    # ── NKF ──────────────────────────────────────────────────────
+    model = NKF(
+        N=N, covariate_dim=k, state_dim=STATE_DIM,
+        flow_layers=FLOW_LAYERS, hidden=HIDDEN, lstm_layers=LSTM_LAYERS,
+    ).to(DEVICE)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\nModel on {DEVICE}  |  {n_params:,} params  |  k={k}")
+
+    print("\n── Training ──────────────────────────────────────────────")
+    model = train(model, loaders, N_EPOCHS, LR, DEVICE, patience=EARLY_STOP_PATIENCE)
+
+    print("\n── Validation set ────────────────────────────────────────")
+    evaluate(model, loaders["val"], N_SAMPLES, HORIZON, DEVICE, y_scaler, tickers)
+
+    print("\n── Test set (NKF) ────────────────────────────────────────")
+    nkf_results = evaluate(
+        model, loaders["test"], N_SAMPLES, HORIZON, DEVICE, y_scaler, tickers
+    )
+
+    # ── Comparison table ─────────────────────────────────────────
+    print("\n── Summary: NKF vs Random Walk ───────────────────────────")
+    print(f"  {'Metric':<22}  {'Random Walk':>12}  {'NKF':>12}  {'Better':>8}")
+    print(f"  {'-'*60}")
+    comparisons = [
+        ("CRPS-Sum-N ↓",    rw_results[0], nkf_results[0], "lower"),
+        ("MAE ↓",           rw_results[1], nkf_results[1], "lower"),
+        ("Dir. Accuracy ↑", rw_results[2], nkf_results[2], "higher"),
+        ("Calibration",     rw_results[3], nkf_results[3], "closer_68"),
+    ]
+    for name, rw, nkf, direction in comparisons:
+        if direction == "lower":
+            winner = "NKF ✓" if nkf < rw else "RW"
+        elif direction == "higher":
+            winner = "NKF ✓" if nkf > rw else "RW"
+        else:
+            winner = "NKF ✓" if abs(nkf - 0.68) < abs(rw - 0.68) else "RW"
+        print(f"  {name:<22}  {rw:>12.4f}  {nkf:>12.4f}  {winner:>8}")
+
+    # ── Plot ─────────────────────────────────────────────────────
+    plot_predictions(model, loaders["test"], y_scaler, tickers,
+                     n_samples=N_SAMPLES, horizon=HORIZON, device=DEVICE,
+                     n_stocks=4)
+    torch.save(model.state_dict(), "nkf_weights.pt")
+    print("\nWeights saved → nkf_weights.pt")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="NKF Pipeline")
+    parser.add_argument(
+        "--run",
+        choices=list(_HANDLES.keys()),
+        default="all",
+        help=f"Which handle to run. Choices: {list(_HANDLES.keys())}",
+    )
+    args = parser.parse_args()
+    print(f"\nRunning handle: '{args.run}'\n")
+    _HANDLES[args.run]()
