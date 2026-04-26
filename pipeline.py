@@ -20,25 +20,27 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+import ast
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 0. Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-CSV_PATH       = "stock.csv"   # stock data path
-COMM_PATH      = "comm.csv"    # commodity data path
+CSV_path       = "stock.csv"   # stock data CSV_new_path
+COMM_path      = "comm.csv"    # commodity data CSV_new_path
+NEWS_path = "news.csv"         # news data CSV path
 WINDOW         = 30            # longer window captures momentum/earnings cycles
 HORIZON        = 5             # steps ahead to forecast
 TRAIN_RATIO    = 0.7
 VAL_RATIO      = 0.15          # remaining 0.15 → test
 BATCH_SIZE     = 100
-N_EPOCHS       = 100            # early stopping will kick in before this
+N_EPOCHS       = 100           # early stopping will kick in before this
 LR             = 1e-3          # slower start reduces early overfitting
 STATE_DIM      = 3             # level + trend + volatility state
 FLOW_LAYERS    = 1             # fewer flow layers → less capacity
 HIDDEN         = 8             # smaller coupling nets + LSTM
 LSTM_LAYERS    = 2             # single LSTM layer
-N_SAMPLES      = 1000           # Monte Carlo forecast samples
+N_SAMPLES      = 1000          # Monte Carlo forecast samples
 PCA_COMPONENTS = 50            # increased to capture ~90% variance
 EARLY_STOP_PATIENCE = 7        # stop if val NLL doesn't improve
 DEVICE         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -116,7 +118,68 @@ def _make_features(ohlcv: dict, label: str):
     )
 
 
-def load_data(stock_path: str, comm_path: str):
+def load_news(news_path: str) -> pd.DataFrame:
+    """
+    Parse a CSV with columns [Date, embedding(list)] where embedding is a serialized
+    list like '([0.1, 0.2, ...])'.
+    Returns a DataFrame indexed by Date with one column per embedding element.
+    """
+    df = pd.read_csv(news_path, index_col=0)
+    df.index = pd.to_datetime(df.index)
+    df.index.name = "Date"
+
+    tensor_col = df.iloc[:, 0]
+
+    def parse_tensor(s):
+        return np.array(ast.literal_eval(str(s).strip()))
+
+    arrays = tensor_col.apply(parse_tensor)
+    n_elements = max(len(a) for a in arrays)
+
+    matrix = np.zeros((len(arrays), n_elements))
+    for i, arr in enumerate(arrays):
+        matrix[i, : len(arr)] = arr
+
+    col_names = [f"emb_{i}" for i in range(n_elements)]
+    return pd.DataFrame(matrix, index=df.index, columns=col_names)
+
+
+def merge_tensor_covars(covars: pd.DataFrame, news_path: str) -> pd.DataFrame:
+    """
+    Merge news embeddings into the covariate DataFrame.
+
+    Loads the news embedding CSV, left-joins it onto covars by date, and
+    zero-pads any trading days with no corresponding news embedding.
+
+    Parameters
+    ----------
+    covars : pd.DataFrame
+        Existing covariate DataFrame indexed by Date, as returned by load_data
+        before the news merge step.
+    news_path : str
+        Path to the news embeddings CSV (Date, list-serialized embedding vector).
+
+    Returns
+    -------
+    pd.DataFrame
+        covars extended with n_elements new columns named 'emb_0', 'emb_1', ...,
+        'emb_{n-1}'. Rows with no matching news date are filled with zeros.
+    """
+    tensor_df = load_news(news_path)  # ← was load_tensor_csv
+    n_elements = tensor_df.shape[1]
+
+    merged = covars.join(tensor_df, how="left")
+    emb_cols = [f"emb_{i}" for i in range(n_elements)]
+    merged[emb_cols] = merged[emb_cols].fillna(0.0)
+
+    print(f"Tensor features: {n_elements} elements | "
+          f"{tensor_df.index.isin(covars.index).sum()} dates matched | "
+          f"{(~tensor_df.index.isin(covars.index)).sum()} tensor dates outside covars range (dropped)")
+
+    return merged
+
+
+def load_data(stock_path: str, comm_path: str, news_path: str):
     """
     Parse stock + commodity CSVs (yfinance multi-level format).
 
@@ -127,8 +190,8 @@ def load_data(stock_path: str, comm_path: str):
     covars    : pd.DataFrame  (T, k)    all features                 → x (covariates)
     dates     : pd.DatetimeIndex
     """
-    def read_csv(path):
-        df = pd.read_csv(path, header=[0, 1], index_col=0, skiprows=[2])
+    def read_csv(CSV_new_path):
+        df = pd.read_csv(CSV_new_path, header=[0, 1], index_col=0, skiprows=[2])
         df.index = pd.to_datetime(df.index)
         df.index.name = "Date"
         return df.sort_index()
@@ -164,6 +227,9 @@ def load_data(stock_path: str, comm_path: str):
     close_raw = close_raw.loc[close_raw.index.isin(close_ret.index)]
 
     N_stocks = len(stock_ohlcv["Close"].columns)
+    # add news to covars
+    covars = merge_tensor_covars(covars, news_path)
+    return close_ret, close_raw, covars, close_ret.index
     print(f"Loaded  {len(close_ret)} trading days  |  "
           f"{N_stocks} stocks + {len(comm_ohlcv['Close'].columns)} commodities  |  "
           f"{covars.shape[1]} raw covariates")
@@ -491,7 +557,7 @@ class NKF(nn.Module):
 # 4. Training
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train(model, loaders, n_epochs, lr, device, patience=7):
+def train(model, loaders, n_epochs, lr, device, patience=7): # partition to window and horizon (p y_t+1 to y_t+T | p y_1 to y_t)
     opt   = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, patience=5, factor=0.5, min_lr=1e-5
@@ -808,7 +874,7 @@ def _load_shared():
     print("Normalizing Kalman Filter — Stock Forecasting Pipeline")
     print("=" * 60)
 
-    close, close_raw, covars, dates = load_data(CSV_PATH, COMM_PATH)
+    close, close_raw, covars, dates = load_data(CSV_path, COMM_path, NEWS_path)
 
     print(f"\nBefore drop_nulls: {close.shape}")
     mask      = close.notna().all(axis=1) & covars.notna().all(axis=1)
