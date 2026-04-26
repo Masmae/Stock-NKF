@@ -179,7 +179,8 @@ def merge_tensor_covars(covars: pd.DataFrame, news_path: str) -> pd.DataFrame:
     return merged
 
 
-def load_data(stock_path: str, comm_path: str, news_path: str):
+def load_data(stock_path: str, comm_path: str, news_path: str,
+              use_comm: bool = True, use_news: bool = True):
     """
     Parse stock + commodity CSVs (yfinance multi-level format).
 
@@ -200,21 +201,28 @@ def load_data(stock_path: str, comm_path: str, news_path: str):
     comm_df  = read_csv(comm_path)
 
     stock_ohlcv = _parse_ohlcv(stock_df)
-    comm_ohlcv  = _parse_ohlcv(comm_df)
 
     # ── Observations: stock close log returns ─────────────────────
     close_raw                  = stock_ohlcv["Close"].copy()
     stock_close_ret, stock_cov = _make_features(stock_ohlcv, label="stk")
-    _,               comm_cov  = _make_features(comm_ohlcv,  label="com")
 
-    # ── Calendar features (shared, added once) ────────────────────
+    # ── Calendar features ─────────────────────────────────────────
     cal = pd.DataFrame(index=stock_close_ret.index)
-    cal["dow"]           = stock_close_ret.index.dayofweek / 4.0
-    cal["month"]         = (stock_close_ret.index.month - 1) / 11.0
-    cal["qtr_end"]       = stock_close_ret.index.is_quarter_end.astype(float)
+    cal["dow"]     = stock_close_ret.index.dayofweek / 4.0
+    cal["month"]   = (stock_close_ret.index.month - 1) / 11.0
+    cal["qtr_end"] = stock_close_ret.index.is_quarter_end.astype(float)
+
+    parts = [stock_cov, cal]
+
+    # ── Optional: commodities ─────────────────────────────────────
+    if use_comm:
+        comm_df   = read_csv(comm_path)
+        comm_ohlcv = _parse_ohlcv(comm_df)
+        _, comm_cov = _make_features(comm_ohlcv, label="com")
+        parts.append(comm_cov)
 
     # ── Align all frames on common dates (inner join) ─────────────
-    covars = pd.concat([stock_cov, comm_cov, cal], axis=1)
+    covars     = pd.concat(parts, axis=1)
     common_idx = stock_close_ret.index.intersection(covars.index)
     close_ret  = stock_close_ret.loc[common_idx]
     covars     = covars.loc[common_idx]
@@ -226,12 +234,15 @@ def load_data(stock_path: str, comm_path: str, news_path: str):
     covars    = covars[mask]
     close_raw = close_raw.loc[close_raw.index.isin(close_ret.index)]
 
+    # ── Optional: news embeddings ─────────────────────────────────
+    if use_news:
+        covars = merge_tensor_covars(covars, news_path)
+
     N_stocks = len(stock_ohlcv["Close"].columns)
-    # add news to covars
-    covars = merge_tensor_covars(covars, news_path)
-    return close_ret, close_raw, covars, close_ret.index
-    print(f"Loaded  {len(close_ret)} trading days  |  "
-          f"{N_stocks} stocks + {len(comm_ohlcv['Close'].columns)} commodities  |  "
+    n_comm   = len(_parse_ohlcv(read_csv(comm_path))["Close"].columns) if use_comm else 0
+    print(f"Loaded  {len(close_ret)} days  |  "
+          f"{N_stocks} stocks  +  {n_comm} comm  +  "
+          f"{'news' if use_news else 'no news'}  |  "
           f"{covars.shape[1]} raw covariates")
     print(f"Date range: {close_ret.index[0].date()} → {close_ret.index[-1].date()}")
     return close_ret, close_raw, covars, close_ret.index
@@ -865,16 +876,21 @@ def handle(name: str):
     return decorator
 
 
-def _load_shared():
+def _load_shared(window=None, use_comm=True, use_news=True):
     """
     Load and preprocess data shared by all handles.
-    Returns loaders, tickers, y_scaler, pca.
+    window     : override WINDOW config if provided
+    use_comm   : include commodity covariates
+    use_news   : include news embedding covariates
     """
     print("=" * 60)
     print("Normalizing Kalman Filter — Stock Forecasting Pipeline")
     print("=" * 60)
 
-    close, close_raw, covars, dates = load_data(CSV_path, COMM_path, NEWS_path)
+    close, close_raw, covars, dates = load_data(
+        CSV_path, COMM_path, NEWS_path,
+        use_comm=use_comm, use_news=use_news
+    )
 
     print(f"\nBefore drop_nulls: {close.shape}")
     mask      = close.notna().all(axis=1) & covars.notna().all(axis=1)
@@ -886,9 +902,34 @@ def _load_shared():
     splits, y_scaler, x_scaler, pca = split_and_scale(
         close, covars, TRAIN_RATIO, VAL_RATIO, PCA_COMPONENTS
     )
-    loaders = make_loaders(splits, WINDOW, HORIZON, BATCH_SIZE)
+    w = window if window is not None else WINDOW
+    loaders = make_loaders(splits, w, HORIZON, BATCH_SIZE)
     tickers = close.columns.tolist()
     return loaders, tickers, y_scaler, pca
+
+
+def _build_and_train(loaders, tickers, y_scaler, pca, label="NKF"):
+    """
+    Build, train, and evaluate an NKF model. Returns (model, results).
+    """
+    N = len(tickers)
+    k = pca.n_components_
+
+    model = NKF(
+        N=N, covariate_dim=k, state_dim=STATE_DIM,
+        flow_layers=FLOW_LAYERS, hidden=HIDDEN, lstm_layers=LSTM_LAYERS,
+    ).to(DEVICE)
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n[{label}] {n_params:,} params  |  N={N}  k={k}")
+
+    model = train(model, loaders, N_EPOCHS, LR, DEVICE,
+                  patience=EARLY_STOP_PATIENCE)
+
+    print(f"\n── [{label}] Test set ────────────────────────────────────")
+    results = evaluate(model, loaders["test"], N_SAMPLES, HORIZON,
+                       DEVICE, y_scaler, tickers)
+    return model, results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1021,6 +1062,124 @@ def run_all():
                      n_stocks=4)
     torch.save(model.state_dict(), "nkf_weights.pt")
     print("\nWeights saved → nkf_weights.pt")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+@handle("window_search")
+def run_window_search():
+    """
+    Compare NKF performance across different input window sizes.
+    Data is loaded once; a fresh model is trained per window size.
+    Run with:  python pipeline.py --run window_search
+
+    Results table (test set):
+        Window | CRPS-Sum | MAE | Dir.Acc | Calibration
+    """
+    WINDOWS = [10, 20, 30, 60, 120]
+
+    # Load data once (full: stocks + comm + news)
+    print("=" * 60)
+    print("Window Search — Loading data once")
+    print("=" * 60)
+
+    close, close_raw, covars, dates = load_data(
+        CSV_path, COMM_path, NEWS_path,
+        use_comm=True, use_news=True
+    )
+    mask      = close.notna().all(axis=1) & covars.notna().all(axis=1)
+    close     = close[mask].sort_index()
+    covars    = covars[mask].sort_index()
+
+    splits, y_scaler, x_scaler, pca = split_and_scale(
+        close, covars, TRAIN_RATIO, VAL_RATIO, PCA_COMPONENTS
+    )
+    tickers = close.columns.tolist()
+
+    results_table = []
+
+    for w in WINDOWS:
+        print(f"\n{'='*60}")
+        print(f"Window = {w}")
+        print(f"{'='*60}")
+
+        loaders = make_loaders(splits, w, HORIZON, BATCH_SIZE)
+        _, res  = _build_and_train(loaders, tickers, y_scaler, pca,
+                                   label=f"W={w}")
+        crps, mae, dir_acc, calib, _ = res
+        results_table.append((w, crps, mae, dir_acc, calib))
+
+    # ── Summary table ─────────────────────────────────────────────
+    print("\n\n── Window Search Results (test set) ──────────────────────")
+    print(f"  {'Window':>8}  {'CRPS-Sum':>10}  {'MAE':>10}  "
+          f"{'Dir.Acc':>9}  {'Calib':>8}")
+    print(f"  {'-'*52}")
+    for w, crps, mae, dir_acc, calib in results_table:
+        print(f"  {w:>8}  {crps:>10.6f}  {mae:>10.6f}  "
+              f"{dir_acc:>9.2%}  {calib:>8.2%}")
+
+    best_w = min(results_table, key=lambda x: x[1])[0]
+    print(f"\n  Best window by CRPS-Sum: {best_w}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+@handle("ablation")
+def run_ablation():
+    """
+    Ablation: compare three data configurations on the test set.
+        1. stocks only          (no commodities, no news)
+        2. stocks + commodities (no news)
+        3. stocks + comm + news (full model)
+
+    All other hyperparameters are held fixed.
+    Run with:  python pipeline.py --run ablation
+    """
+    configs = [
+        ("Stocks only",        False, False),
+        ("Stocks + Comm",      True,  False),
+        ("Stocks + Comm + News", True, True),
+    ]
+
+    results_table = []
+
+    for label, use_comm, use_news in configs:
+        print(f"\n{'='*60}")
+        print(f"Ablation: {label}")
+        print(f"{'='*60}")
+
+        loaders, tickers, y_scaler, pca = _load_shared(
+            use_comm=use_comm, use_news=use_news
+        )
+        _, res = _build_and_train(loaders, tickers, y_scaler, pca,
+                                  label=label)
+        crps, mae, dir_acc, calib, _ = res
+        results_table.append((label, crps, mae, dir_acc, calib))
+
+    # ── Summary table ─────────────────────────────────────────────
+    print("\n\n── Ablation Results (test set) ───────────────────────────")
+    print(f"  {'Config':<26}  {'CRPS-Sum':>10}  {'MAE':>10}  "
+          f"{'Dir.Acc':>9}  {'Calib':>8}")
+    print(f"  {'-'*68}")
+    for label, crps, mae, dir_acc, calib in results_table:
+        print(f"  {label:<26}  {crps:>10.6f}  {mae:>10.6f}  "
+              f"{dir_acc:>9.2%}  {calib:>8.2%}")
+
+    # Mark best per metric
+    print("\n  Best per metric:")
+    for metric_idx, metric_name in [(1, "CRPS-Sum"), (2, "MAE"),
+                                    (3, "Dir.Acc"), (4, "Calib")]:
+        if metric_name == "Calib":
+            best = min(results_table, key=lambda x: abs(x[metric_idx] - 0.68))
+        elif metric_name == "Dir.Acc":
+            best = max(results_table, key=lambda x: x[metric_idx])
+        else:
+            best = min(results_table, key=lambda x: x[metric_idx])
+        print(f"    {metric_name}: {best[0]}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
